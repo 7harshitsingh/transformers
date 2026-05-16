@@ -22,6 +22,13 @@ from ..nanochat.configuration_nanochat import NanoChatConfig
 @strict
 class EZConfig(NanoChatConfig):
     r"""
+    Args:
+    window_pattern (`str`, *optional*, defaults to `"SSSL"`):
+        Sliding window attention pattern tiled across layers. 'L' = full context, 'S' = quarter context.
+        Last layer always gets full context regardless of pattern.
+    smear_gate_in_features (`int`, *optional*, defaults to `24`):
+        Input feature width for the smear gate projection Linear(smear_gate_in_features, 1).
+
     Example:
 
     ```python

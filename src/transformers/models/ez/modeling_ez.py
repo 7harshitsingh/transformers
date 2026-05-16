@@ -243,6 +243,7 @@ class EZAttention(nn.Module):
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         attention_mask: torch.Tensor | None = None,
         past_key_values: Cache | None = None,
+        window_size: tuple[int, int] | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         input_shape = hidden_states.shape[:-1]
@@ -265,6 +266,22 @@ class EZAttention(nn.Module):
 
         if past_key_values is not None:
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
+
+        # Sliding window: add an additive -inf mask for keys outside the window.
+        # window_size is (left, right): left=-1 means full context, skip masking.
+        if window_size is not None:
+            left, _ = window_size
+            if left > 0:
+                T_q = query_states.shape[2]
+                T_kv = key_states.shape[2]
+                window_mask = torch.zeros(T_q, T_kv, dtype=query_states.dtype, device=query_states.device)
+                for q_idx in range(T_q):
+                    # absolute position of this query in the full kv sequence
+                    q_pos = T_kv - T_q + q_idx
+                    cutoff = q_pos - left
+                    if cutoff > 0:
+                        window_mask[q_idx, :cutoff] = float("-inf")
+                attention_mask = (attention_mask if attention_mask is not None else 0) + window_mask
 
         attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
             self.config._attn_implementation, eager_attention_forward
@@ -301,25 +318,23 @@ class EZDecoderLayer(GradientCheckpointingLayer):
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.LongTensor | None = None,
         past_key_values: Cache | None = None,
-        use_cache: bool | None = False,
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+        window_size: tuple[int, int] | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        # Self Attention
         hidden_states, _ = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
-            use_cache=use_cache,
             position_embeddings=position_embeddings,
+            window_size=window_size,
             **kwargs,
         )
         hidden_states = residual + hidden_states
 
-        # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
@@ -344,6 +359,8 @@ class EZPreTrainedModel(PreTrainedModel):
         "hidden_states": EZDecoderLayer,
         "attentions": EZAttention,
     }
+    config_class = EZConfig
+    _tied_weights_keys = []  # no weight tying (tie_word_embeddings = False)
 
     def _init_weights(self, module: nn.Module) -> None:
         super()._init_weights(module)
@@ -353,7 +370,6 @@ class EZPreTrainedModel(PreTrainedModel):
                 mean=0.0,
                 std=self.config.initializer_range / math.sqrt(2 * self.config.num_hidden_layers),
             )
-        # smear_gate is a plain Linear — uniform init matching training
         if isinstance(module, nn.Linear) and getattr(module, "_is_smear_gate", False):
             nn.init.uniform_(module.weight, 0.0, 0.02)
 
@@ -377,20 +393,18 @@ class EZModel(EZPreTrainedModel):
         self.gradient_checkpointing = False
 
         # Per-layer learnable scalars
-        # resid_lambdas: scales residual stream before each block (init 1.0, real init handled separately)
-        # x0_lambdas:   blends initial embedding back in at each layer  (init 0.0)
         self.resid_lambdas = nn.Parameter(torch.ones(config.num_hidden_layers))
         self.x0_lambdas = nn.Parameter(torch.zeros(config.num_hidden_layers))
 
         # Smear: mix previous token embedding into current position (cheap bigram info)
         self.smear_gate = nn.Linear(config.smear_gate_in_features, 1, bias=False)
-        self.smear_gate._is_smear_gate = True  # flag for _init_weights
+        self.smear_gate._is_smear_gate = True
         self.smear_lambda = nn.Parameter(torch.zeros(1))
 
-        # Backout: subtract mid-layer residual before final norm to remove low-level features
+        # Backout: subtract mid-layer residual before final norm
         self.backout_lambda = nn.Parameter(0.2 * torch.ones(1))
 
-        # Precompute per-layer window sizes from pattern string
+        # Per-layer window sizes derived from window_pattern
         self._window_sizes = self._compute_window_sizes(config)
 
         # Initialize weights and apply final processing
@@ -435,15 +449,11 @@ class EZModel(EZPreTrainedModel):
 
         position_embeddings = self.rotary_emb(inputs_embeds, position_ids=position_ids)
 
-        # Initial norm (same as NanoChat — norm before entering trunk)
+        # Initial norm before trunk (matches training)
         hidden_states = self.norm(inputs_embeds)
 
         # ------------------------------------------------------------------
         # Smear: mix previous token embedding into current position
-        # Training/prefill: full sequence available, use slice approach
-        # Decode:           single new token, no prev embedding available in
-        #                   HF cache API, so smear is skipped (negligible
-        #                   quality impact at single-token decode steps)
         # ------------------------------------------------------------------
         T = hidden_states.shape[1]
         if past_seen_tokens == 0 and T > 1:
@@ -456,14 +466,13 @@ class EZModel(EZPreTrainedModel):
             )
 
         # ------------------------------------------------------------------
-        # Transformer trunk with per-layer resid/x0 scalars and backout
+        # Transformer trunk with per-layer resid/x0 scalars, window, backout
         # ------------------------------------------------------------------
-        x0 = hidden_states  # save initial embedding for x0 blending
+        x0 = hidden_states
         backout_layer_idx = self.config.num_hidden_layers // 2
         x_backout = None
 
         for i, decoder_layer in enumerate(self.layers[: self.config.num_hidden_layers]):
-            # Per-layer residual scaling + initial embedding blending
             hidden_states = (
                 self.resid_lambdas[i].to(hidden_states.dtype) * hidden_states
                 + self.x0_lambdas[i].to(hidden_states.dtype) * x0
@@ -475,14 +484,14 @@ class EZModel(EZPreTrainedModel):
                 position_embeddings=position_embeddings,
                 position_ids=position_ids,
                 past_key_values=past_key_values,
+                window_size=self._window_sizes[i],
                 **kwargs,
             )
 
-            # Cache mid-layer residual for backout
             if i == backout_layer_idx:
                 x_backout = hidden_states
 
-        # Backout: subtract mid-layer residual to remove low-level features
+        # Backout: subtract mid-layer residual
         if x_backout is not None:
             hidden_states = hidden_states - self.backout_lambda.to(hidden_states.dtype) * x_backout
 
@@ -506,7 +515,6 @@ class EZModel(EZPreTrainedModel):
         long_win = config.max_position_embeddings
         short_win = math.ceil(long_win / 4 / 128) * 128
         char_to_win = {"L": (-1, 0), "S": (short_win, 0)}
-
         sizes = [char_to_win[pattern[i % len(pattern)]] for i in range(config.num_hidden_layers)]
         sizes[-1] = (-1, 0)  # last layer always full context
         return sizes
