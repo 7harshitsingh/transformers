@@ -137,7 +137,7 @@ if TYPE_CHECKING:
     from .exaone4 import *
     from .exaone4_5 import *
     from .exaone_moe import *
-    from .ez import *nanochat
+    from .ez import *
     from .falcon import *
     from .falcon_h1 import *
     from .falcon_mamba import *
