@@ -19,7 +19,6 @@
 # limitations under the License.
 
 import math
-from collections.abc import Callable
 from dataclasses import dataclass
 from numbers import Number
 
@@ -28,26 +27,26 @@ import torch
 from torch import Tensor, nn
 
 from ... import initialization as init
+from ...modeling_utils import PreTrainedModel
+from ...pytorch_utils import compile_compatible_method_lru_cache
+from ...utils import (
+    ModelOutput, auto_docstring, is_accelerate_available, is_scipy_available, requires_backends)
+from ..auto import AutoBackbone
+from .configuration_maskformer_swin import MaskFormerSwinConfig
+from .configuration_maskformer import MaskFormerConfig
+from collections.abc import Callable
 from ...activations import ACT2FN
 from ...masking_utils import create_bidirectional_mask
 from ...modeling_layers import GradientCheckpointingLayer
-from ...modeling_outputs import BaseModelOutputWithCrossAttentions
-from ...modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
+from ...modeling_outputs import (
+    BaseModelOutputWithCrossAttentions)
+from ...modeling_utils import ALL_ATTENTION_FUNCTIONS
 from ...processing_utils import Unpack
-from ...pytorch_utils import compile_compatible_method_lru_cache
 from ...utils import (
-    ModelOutput,
-    TransformersKwargs,
-    auto_docstring,
-    is_accelerate_available,
-    is_scipy_available,
-    requires_backends,
-)
+    TransformersKwargs)
 from ...utils.generic import merge_with_config_defaults
 from ...utils.output_capturing import capture_outputs
-from ..auto import AutoBackbone
-from .configuration_maskformer import MaskFormerConfig, MaskFormerDetrConfig
-from .configuration_maskformer_swin import MaskFormerSwinConfig
+from .configuration_maskformer import MaskFormerDetrConfig
 
 
 if is_accelerate_available():
@@ -285,6 +284,7 @@ class MaskFormerDetrLearnedPositionEmbedding(nn.Module):
         # expected by the encoder
         pos = pos.flatten(2).permute(0, 2, 1)
         return pos
+
 
 
 def eager_attention_forward(
@@ -632,9 +632,7 @@ class MaskFormerDetrMaskHeadSmallConv(nn.Module):
             [
                 MaskFormerDetrFPNFusionStage(fpn_channels[0], hidden_size // 2, hidden_size // 4, activation_function),
                 MaskFormerDetrFPNFusionStage(fpn_channels[1], hidden_size // 4, hidden_size // 8, activation_function),
-                MaskFormerDetrFPNFusionStage(
-                    fpn_channels[2], hidden_size // 8, hidden_size // 16, activation_function
-                ),
+                MaskFormerDetrFPNFusionStage(fpn_channels[2], hidden_size // 8, hidden_size // 16, activation_function),
             ]
         )
 
@@ -2063,9 +2061,4 @@ class MaskFormerForInstanceSegmentation(MaskFormerPreTrainedModel):
         )
 
 
-__all__ = [
-    "MaskFormerForInstanceSegmentation",
-    "MaskFormerModel",
-    "MaskFormerPreTrainedModel",
-    "MaskFormerDetrPreTrainedModel",
-]
+__all__ = ["MaskFormerForInstanceSegmentation", "MaskFormerModel", "MaskFormerPreTrainedModel", "MaskFormerDetrPreTrainedModel"]
