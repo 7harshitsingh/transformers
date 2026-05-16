@@ -16,6 +16,7 @@ from huggingface_hub.dataclasses import strict
 
 from ...utils import auto_docstring
 from ..nanochat.configuration_nanochat import NanoChatConfig
+from ...modeling_rope_utils import RopeParameters
 
 
 @auto_docstring(checkpoint="7harshitsingh/ez1-e129")
