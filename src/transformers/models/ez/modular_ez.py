@@ -34,7 +34,6 @@ from ..nanochat.modeling_nanochat import (
     NanoChatPreTrainedModel,
     NanoChatRMSNorm,
     NanoChatRotaryEmbedding,
-    apply_rotary_pos_emb,
     eager_attention_forward,
 )
 from .configuration_ez import EZConfig
@@ -76,16 +75,30 @@ class EZAttention(NanoChatAttention):
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
-        query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-        key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        # Keep in (B, T, H, D) layout to apply RoPE — matches nanochat's apply_rotary_emb
+        query_states = self.q_proj(hidden_states).view(hidden_shape)   # (B, T, H, D)
+        key_states = self.k_proj(hidden_states).view(hidden_shape)     # (B, T, H, D)
+        value_states = self.v_proj(hidden_states).view(hidden_shape)   # (B, T, H, D)
 
+        # Apply RoPE in (B, T, H, D) — nanochat rotates pairs of dims in last axis
+        # cos/sin from EZRotaryEmbedding: (B, T, D) → unsqueeze to (B, T, 1, D//2)
         cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        cos = cos.unsqueeze(2) if cos.dim() == 3 else cos  # (B or 1, T, 1, D//2)
+        sin = sin.unsqueeze(2) if sin.dim() == 3 else sin
+        d = query_states.shape[3] // 2
+        q1, q2 = query_states[..., :d], query_states[..., d:]
+        k1, k2 = key_states[..., :d], key_states[..., d:]
+        query_states = torch.cat([q1 * cos + q2 * sin, q1 * (-sin) + q2 * cos], dim=3)
+        key_states = torch.cat([k1 * cos + k2 * sin, k1 * (-sin) + k2 * cos], dim=3)
 
-        # RoPE -> Norm (same as NanoChat)
+        # QK norm in (B, T, H, D) layout, then transpose to (B, H, T, D) for attention
         query_states = self.q_norm(query_states)
         key_states = self.k_norm(key_states)
+
+        # Transpose to (B, H, T, D) for attention interface
+        query_states = query_states.transpose(1, 2)
+        key_states = key_states.transpose(1, 2)
+        value_states = value_states.transpose(1, 2)
 
         # Sharper attention: split scale between Q and K
         query_states = query_states * 1.2
@@ -94,20 +107,19 @@ class EZAttention(NanoChatAttention):
         if past_key_values is not None:
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
-        # Sliding window: add an additive -inf mask for keys outside the window.
-        # window_size is (left, right): left=-1 means full context, skip masking.
+        # Sliding window: mask keys more than `left` positions before each query.
+        # Matches nanochat FA3 window_size=(left, 0) convention.
+        # Only applied when sequence length actually exceeds the window.
         if window_size is not None:
             left, _ = window_size
-            if left > 0:
-                T_q = query_states.shape[2]
-                T_kv = key_states.shape[2]
+            T_q = query_states.shape[2]
+            T_kv = key_states.shape[2]
+            if left > 0 and T_kv > left:
+                q_positions = torch.arange(T_kv - T_q, T_kv, device=query_states.device).unsqueeze(1)  # (T_q, 1)
+                k_positions = torch.arange(T_kv, device=query_states.device).unsqueeze(0)               # (1, T_kv)
+                outside_window = (q_positions - k_positions) >= left                                     # (T_q, T_kv)
                 window_mask = torch.zeros(T_q, T_kv, dtype=query_states.dtype, device=query_states.device)
-                for q_idx in range(T_q):
-                    # absolute position of this query in the full kv sequence
-                    q_pos = T_kv - T_q + q_idx
-                    cutoff = q_pos - left
-                    if cutoff > 0:
-                        window_mask[q_idx, :cutoff] = float("-inf")
+                window_mask = window_mask.masked_fill(outside_window, float("-inf"))
                 attention_mask = (attention_mask if attention_mask is not None else 0) + window_mask
 
         attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
@@ -229,9 +241,9 @@ class EZModel(NanoChatModel):
         )
         long_win = config.max_position_embeddings
         short_win = math.ceil(long_win / 4 / 128) * 128
-        char_to_win = {"L": (-1, 0), "S": (short_win, 0)}
+        char_to_win = {"L": (long_win, 0), "S": (short_win, 0)}
         sizes = [char_to_win[pattern[i % len(pattern)]] for i in range(config.num_hidden_layers)]
-        sizes[-1] = (-1, 0)   # last layer always full context
+        sizes[-1] = (long_win, 0)   # last layer always full context
         return sizes
 
     def forward(
@@ -332,8 +344,6 @@ class EZModel(NanoChatModel):
 
 @auto_docstring
 class EZForCausalLM(NanoChatForCausalLM):
-    _tied_weights_keys = []     
-    
     def forward(self, **super_kwargs) -> CausalLMOutputWithPast:
         r"""
         Example:
