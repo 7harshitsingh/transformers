@@ -254,16 +254,25 @@ class EZAttention(nn.Module):
         key_states = self.k_proj(hidden_states).view(hidden_shape)  # (B, T, H, D)
         value_states = self.v_proj(hidden_states).view(hidden_shape)  # (B, T, H, D)
 
-        # Apply RoPE in (B, T, H, D) — nanochat rotates pairs of dims in last axis
-        # cos/sin from EZRotaryEmbedding: (B, T, D) → unsqueeze to (B, T, 1, D//2)
+        # Apply RoPE in (B, T, H, D) layout — matches nanochat apply_rotary_emb exactly.
+        # EZRotaryEmbedding returns cos/sin of shape (B, T, D) where D = head_dim.
+        # Nanochat splits head_dim in half: x = [x1, x2], rotated = [x1*cos + x2*sin, x1*(-sin) + x2*cos]
         cos, sin = position_embeddings
-        cos = cos.unsqueeze(2) if cos.dim() == 3 else cos  # (B or 1, T, 1, D//2)
-        sin = sin.unsqueeze(2) if sin.dim() == 3 else sin
-        d = query_states.shape[3] // 2
-        q1, q2 = query_states[..., :d], query_states[..., d:]
-        k1, k2 = key_states[..., :d], key_states[..., d:]
-        query_states = torch.cat([q1 * cos + q2 * sin, q1 * (-sin) + q2 * cos], dim=3)
-        key_states = torch.cat([k1 * cos + k2 * sin, k1 * (-sin) + k2 * cos], dim=3)
+        # cos/sin: (B, T, D) or (1, T, 1, D//2) depending on rotary impl
+        # Normalise to (1, T, 1, head_dim//2) for (B, T, H, D) broadcasting
+        if cos.dim() == 3:
+            cos = cos.unsqueeze(2)  # (B, T, 1, D) — full head_dim
+            sin = sin.unsqueeze(2)
+        # cos/sin are now (..., head_dim) — split query/key along last dim
+        head_dim = query_states.shape[3]
+        half = head_dim // 2
+        q1, q2 = query_states[..., :half], query_states[..., half:]
+        k1, k2 = key_states[..., :half], key_states[..., half:]
+        # cos/sin may be full head_dim or half — slice to half if needed
+        c = cos[..., :half]
+        s = sin[..., :half]
+        query_states = torch.cat([q1 * c + q2 * s, q1 * (-s) + q2 * c], dim=3)
+        key_states = torch.cat([k1 * c + k2 * s, k1 * (-s) + k2 * c], dim=3)
 
         # QK norm in (B, T, H, D) layout, then transpose to (B, H, T, D) for attention
         query_states = self.q_norm(query_states)
