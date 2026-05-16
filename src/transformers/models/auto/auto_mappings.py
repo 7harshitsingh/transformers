@@ -171,6 +171,7 @@ CONFIG_MAPPING_NAMES = OrderedDict(
         ("exaone4", "Exaone4Config"),
         ("exaone4_5", "Exaone4_5_Config"),
         ("exaone4_5_vision", "Exaone4_5_VisionConfig"),
+        ("ez", "EZConfig"),
         ("exaone_moe", "ExaoneMoeConfig"),
         ("falcon", "FalconConfig"),
         ("falcon_h1", "FalconH1Config"),

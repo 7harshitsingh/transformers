@@ -73,6 +73,7 @@ class EZConfig(NanoChatConfig):
     num_attention_heads: int = 24
     num_key_value_heads: int | None = 4
     max_position_embeddings: int = 8192
+    rope_parameters: RopeParameters | dict | None = None  # keep as inherited
 
     def __post_init__(self, **kwargs):
         if self.intermediate_size != 3 * self.hidden_size:
@@ -80,6 +81,12 @@ class EZConfig(NanoChatConfig):
                 f"EZConfig requires intermediate_size == 3 * hidden_size, "
                 f"got intermediate_size={self.intermediate_size} and hidden_size={self.hidden_size}."
             )
+        # Set correct rope_theta if not already specified
+        if self.rope_parameters is None:
+            self.rope_parameters = {"rope_type": "default", "rope_theta": 100000.0}
+        elif isinstance(self.rope_parameters, dict) and "rope_theta" not in self.rope_parameters:
+            self.rope_parameters["rope_theta"] = 100000.0
+
         super().__post_init__(**kwargs)
 
 
