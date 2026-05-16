@@ -332,6 +332,8 @@ class EZModel(NanoChatModel):
 
 @auto_docstring
 class EZForCausalLM(NanoChatForCausalLM):
+    _tied_weights_keys = []     
+    
     def forward(self, **super_kwargs) -> CausalLMOutputWithPast:
         r"""
         Example:

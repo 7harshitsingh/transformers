@@ -522,7 +522,7 @@ class EZModel(EZPreTrainedModel):
 
 @auto_docstring
 class EZForCausalLM(EZPreTrainedModel, GenerationMixin):
-    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
+    _tied_weights_keys = []
     _tp_plan = {"lm_head": "colwise_gather_output"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
 
