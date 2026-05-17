@@ -195,15 +195,22 @@ def write_tokenizer(input_dir, output_dir):
 def run_test(output_dir, prompt, max_new_tokens=64):
     print(f"Testing with prompt: {prompt}")
     tokenizer = AutoTokenizer.from_pretrained(output_dir)
-    model = EZForCausalLM.from_pretrained(output_dir, torch_dtype=torch.bfloat16)
+    model = EZForCausalLM.from_pretrained(output_dir, dtype=torch.bfloat16)
     model.eval()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
     inputs = tokenizer(prompt, return_tensors="pt").to(device)
     with torch.no_grad():
-        output = model.generate(**inputs, max_new_tokens=max_new_tokens)
-    print(tokenizer.decode(output[0, inputs.input_ids.shape[1]:], skip_special_tokens=True))
-
+        output = model.generate(
+            **inputs,
+            max_new_tokens=128,
+            do_sample=True,
+            temperature=0.25,
+            top_k=40,
+            repetition_penalty=1.5,
+        )
+    generated = output[0, inputs["input_ids"].shape[1] :]
+    print(tokenizer.decode(generated, skip_special_tokens=False))
 
 # ---------------------------------------------------------------------------
 # CLI

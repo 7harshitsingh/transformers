@@ -51,7 +51,23 @@ class EZRMSNorm(NanoChatRMSNorm):
 
 
 class EZRotaryEmbedding(NanoChatRotaryEmbedding):
-    pass
+    def forward(self, x: torch.Tensor, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Override to match nanochat exact cos/sin shape: (1, T, 1, head_dim//2).
+        NanoChatRotaryEmbedding (via LlamaRotaryEmbedding) returns (B, T, head_dim)
+        via cat(freqs, freqs). We return raw freqs.cos()/sin() with the singleton
+        head dim nanochat uses, so EZAttention broadcasts over (B, T, H, head_dim//2)
+        without any slicing.
+        """
+        inv_freq = self.inv_freq.to(x.device)
+        t = position_ids[0].float()                          # (T,) — first batch row
+        freqs = torch.outer(t, inv_freq.float())             # (T, head_dim//2)
+        cos = freqs.cos() * self.attention_scaling           # (T, head_dim//2)
+        sin = freqs.sin() * self.attention_scaling
+        cos = cos.to(dtype=x.dtype)
+        sin = sin.to(dtype=x.dtype)
+        # (1, T, 1, head_dim//2) — exact nanochat shape for (B, T, H, D//2) broadcasting
+        return cos[None, :, None, :], sin[None, :, None, :]
 
 
 class EZMLP(NanoChatMLP):
@@ -81,24 +97,14 @@ class EZAttention(NanoChatAttention):
         value_states = self.v_proj(hidden_states).view(hidden_shape)   # (B, T, H, D)
 
         # Apply RoPE in (B, T, H, D) layout — matches nanochat apply_rotary_emb exactly.
-        # EZRotaryEmbedding returns cos/sin of shape (B, T, D) where D = head_dim.
-        # Nanochat splits head_dim in half: x = [x1, x2], rotated = [x1*cos + x2*sin, x1*(-sin) + x2*cos]
-        cos, sin = position_embeddings
-        # cos/sin: (B, T, D) or (1, T, 1, D//2) depending on rotary impl
-        # Normalise to (1, T, 1, head_dim//2) for (B, T, H, D) broadcasting
-        if cos.dim() == 3:
-            cos = cos.unsqueeze(2)   # (B, T, 1, D) — full head_dim
-            sin = sin.unsqueeze(2)
-        # cos/sin are now (..., head_dim) — split query/key along last dim
-        head_dim = query_states.shape[3]
-        half = head_dim // 2
+        # EZRotaryEmbedding.forward returns cos/sin of shape (1, T, 1, head_dim//2),
+        # which broadcasts directly over (B, T, H, head_dim//2) — no unsqueeze needed.
+        cos, sin = position_embeddings   # each (1, T, 1, head_dim//2)
+        half = cos.shape[-1]             # head_dim // 2
         q1, q2 = query_states[..., :half], query_states[..., half:]
         k1, k2 = key_states[..., :half], key_states[..., half:]
-        # cos/sin may be full head_dim or half — slice to half if needed
-        c = cos[..., :half]
-        s = sin[..., :half]
-        query_states = torch.cat([q1 * c + q2 * s, q1 * (-s) + q2 * c], dim=3)
-        key_states = torch.cat([k1 * c + k2 * s, k1 * (-s) + k2 * c], dim=3)
+        query_states = torch.cat([q1 * cos + q2 * sin, q1 * (-sin) + q2 * cos], dim=3)
+        key_states = torch.cat([k1 * cos + k2 * sin, k1 * (-sin) + k2 * cos], dim=3)
 
         # QK norm in (B, T, H, D) layout, then transpose to (B, H, T, D) for attention
         query_states = self.q_norm(query_states)
@@ -353,6 +359,8 @@ class EZModel(NanoChatModel):
 
 @auto_docstring
 class EZForCausalLM(NanoChatForCausalLM):
+    _tied_weights_keys = []   # no weight tying — tie_word_embeddings = False
+
     def forward(self, **super_kwargs) -> CausalLMOutputWithPast:
         r"""
         Example:
