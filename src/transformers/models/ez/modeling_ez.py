@@ -288,17 +288,29 @@ class EZAttention(nn.Module):
         # Sliding window: mask keys more than `left` positions before each query.
         # Matches nanochat FA3 window_size=(left, 0) convention.
         # Only applied when sequence length actually exceeds the window.
+        # detect if FA3 is being used
+        using_fa3 = self.config._attn_implementation in (
+            "flash_attention_3",
+            "fa3",
+            "kernels-community/vllm-flash-attn3",
+        )
+
         if window_size is not None:
             left, _ = window_size
             T_q = query_states.shape[2]
             T_kv = key_states.shape[2]
             if left > 0 and T_kv > left:
-                q_positions = torch.arange(T_kv - T_q, T_kv, device=query_states.device).unsqueeze(1)  # (T_q, 1)
-                k_positions = torch.arange(T_kv, device=query_states.device).unsqueeze(0)  # (1, T_kv)
-                outside_window = (q_positions - k_positions) >= left  # (T_q, T_kv)
-                window_mask = torch.zeros(T_q, T_kv, dtype=query_states.dtype, device=query_states.device)
-                window_mask = window_mask.masked_fill(outside_window, float("-inf"))
-                attention_mask = (attention_mask if attention_mask is not None else 0) + window_mask
+                if using_fa3:
+                    # FA3 handles window natively — pass via kwargs, not mask
+                    kwargs["sliding_window"] = left
+                else:
+                    q_positions = torch.arange(T_kv - T_q, T_kv, device=query_states.device).unsqueeze(1)
+                    k_positions = torch.arange(T_kv, device=query_states.device).unsqueeze(0)
+                    outside_window = (q_positions - k_positions) >= left
+                    window_mask = torch.zeros(T_q, T_kv, dtype=query_states.dtype, device=query_states.device)
+                    window_mask = window_mask.masked_fill(outside_window, float("-inf"))
+                    window_mask = window_mask.unsqueeze(0).unsqueeze(0)
+                    attention_mask = (attention_mask if attention_mask is not None else 0) + window_mask
 
         attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
             self.config._attn_implementation, eager_attention_forward
