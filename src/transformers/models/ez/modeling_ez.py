@@ -30,14 +30,14 @@ from ...activations import ACT2FN
 from ...cache_utils import Cache, DynamicCache
 from ...generation import GenerationMixin
 from ...integrations import use_kernel_func_from_hub, use_kernelized_func
-from ...masking_utils import create_causal_mask
+from ...masking_utils import ALL_MASK_ATTENTION_FUNCTIONS, create_causal_mask, flash_attention_mask
 from ...modeling_layers import GradientCheckpointingLayer
 from ...modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 from ...modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 from ...modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from ...processing_utils import Unpack
-from ...utils import TransformersKwargs, auto_docstring
-from ...utils.generic import can_return_tuple, merge_with_config_defaults
+from ...utils import TransformersKwargs, auto_docstring, can_return_tuple
+from ...utils.generic import merge_with_config_defaults
 from ...utils.output_capturing import capture_outputs
 from .configuration_ez import EZConfig
 
@@ -110,21 +110,20 @@ class EZRotaryEmbedding(nn.Module):
     @dynamic_rope_update  # power user: used with advanced RoPE types (e.g. dynamic rope)
     def forward(self, x: torch.Tensor, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        Override to match nanochat exact cos/sin shape: (1, T, 1, head_dim//2).
+        Override to match nanochat exact cos/sin shape: (B, T, 1, head_dim//2).
         NanoChatRotaryEmbedding (via LlamaRotaryEmbedding) returns (B, T, head_dim)
         via cat(freqs, freqs). We return raw freqs.cos()/sin() with the singleton
         head dim nanochat uses, so EZAttention broadcasts over (B, T, H, head_dim//2)
         without any slicing.
         """
-        inv_freq = self.inv_freq.to(x.device)
-        t = position_ids[0].float()  # (T,) — first batch row
-        freqs = torch.outer(t, inv_freq.float())  # (T, head_dim//2)
-        cos = freqs.cos() * self.attention_scaling  # (T, head_dim//2)
-        sin = freqs.sin() * self.attention_scaling
-        cos = cos.to(dtype=x.dtype)
-        sin = sin.to(dtype=x.dtype)
-        # (1, T, 1, head_dim//2) — exact nanochat shape for (B, T, H, D//2) broadcasting
-        return cos[None, :, None, :], sin[None, :, None, :]
+        inv_freq = self.inv_freq.to(x.device).float()
+        # Per-row positions: with left padding every row has its own offsets, so using
+        # position_ids[0] for the whole batch would misplace every other row's tokens.
+        freqs = position_ids.float()[:, :, None] * inv_freq[None, None, :]  # (B, T, head_dim//2)
+        cos = (freqs.cos() * self.attention_scaling).to(dtype=x.dtype)
+        sin = (freqs.sin() * self.attention_scaling).to(dtype=x.dtype)
+        # (B, T, 1, head_dim//2) — broadcasts over (B, T, H, head_dim//2)
+        return cos[:, :, None, :], sin[:, :, None, :]
 
 
 class EZMLP(nn.Module):
@@ -260,9 +259,9 @@ class EZAttention(nn.Module):
         value_states = self.v_proj(hidden_states).view(hidden_shape)  # (B, T, H, D)
 
         # Apply RoPE in (B, T, H, D) layout — matches nanochat apply_rotary_emb exactly.
-        # EZRotaryEmbedding.forward returns cos/sin of shape (1, T, 1, head_dim//2),
+        # EZRotaryEmbedding.forward returns cos/sin of shape (B, T, 1, head_dim//2),
         # which broadcasts directly over (B, T, H, head_dim//2) — no unsqueeze needed.
-        cos, sin = position_embeddings  # each (1, T, 1, head_dim//2)
+        cos, sin = position_embeddings  # each (B, T, 1, head_dim//2)
         half = cos.shape[-1]  # head_dim // 2
         q1, q2 = query_states[..., :half], query_states[..., half:]
         k1, k2 = key_states[..., :half], key_states[..., half:]
@@ -285,32 +284,36 @@ class EZAttention(nn.Module):
         if past_key_values is not None:
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
-        # Sliding window: mask keys more than `left` positions before each query.
-        # Matches nanochat FA3 window_size=(left, 0) convention.
-        # Only applied when sequence length actually exceeds the window.
-        # detect if FA3 is being used
-        using_fa3 = self.config._attn_implementation in (
-            "flash_attention_3",
-            "fa3",
-            "kernels-community/vllm-flash-attn3",
-        )
-
+        # Sliding window: keep only keys at most `left` positions before each query.
+        # Matches nanochat FA3 window_size=(left, 0), whose bounds are inclusive.
+        # The mask built here is itself causal, so it is safe even when the library handed
+        # us None because sdpa could otherwise have taken its is_causal fast path.
         if window_size is not None:
             left, _ = window_size
-            T_q = query_states.shape[2]
-            T_kv = key_states.shape[2]
-            if left > 0 and T_kv > left:
-                if using_fa3:
-                    # FA3 handles window natively — pass via kwargs, not mask
-                    kwargs["sliding_window"] = left
-                else:
-                    q_positions = torch.arange(T_kv - T_q, T_kv, device=query_states.device).unsqueeze(1)
-                    k_positions = torch.arange(T_kv, device=query_states.device).unsqueeze(0)
-                    outside_window = (q_positions - k_positions) >= left
-                    window_mask = torch.zeros(T_q, T_kv, dtype=query_states.dtype, device=query_states.device)
-                    window_mask = window_mask.masked_fill(outside_window, float("-inf"))
-                    window_mask = window_mask.unsqueeze(0).unsqueeze(0)
-                    attention_mask = (attention_mask if attention_mask is not None else 0) + window_mask
+            T_q, T_kv = query_states.shape[2], key_states.shape[2]
+            if left > 0 and T_kv > left + 1:
+                impl = (self.config._attn_implementation or "").removeprefix("paged|")
+                mask_fn = ALL_MASK_ATTENTION_FUNCTIONS._global_mapping.get(impl)
+                # hub kernel names register lazily, so fall back to a name check
+                using_flash = mask_fn is flash_attention_mask or "flash" in impl.lower()
+                if using_flash:
+                    # flash handles the window natively; HF maps sliding_window -> (sliding_window - 1, 0),
+                    # so +1 lands on the inclusive (left, 0) window used in training
+                    kwargs["sliding_window"] = left + 1
+                elif attention_mask is None or isinstance(attention_mask, torch.Tensor):
+                    device = query_states.device
+                    q_positions = torch.arange(T_kv - T_q, T_kv, device=device)[:, None]
+                    k_positions = torch.arange(T_kv, device=device)[None, :]
+                    keep = ((k_positions <= q_positions) & ((q_positions - k_positions) <= left))[None, None]
+                    if attention_mask is None:
+                        attention_mask = torch.zeros(
+                            1, 1, T_q, T_kv, dtype=query_states.dtype, device=device
+                        ).masked_fill(~keep, torch.finfo(query_states.dtype).min)
+                    elif attention_mask.dtype == torch.bool:
+                        attention_mask = attention_mask & keep
+                    else:
+                        attention_mask = attention_mask.masked_fill(~keep, torch.finfo(attention_mask.dtype).min)
+                # else: flex_attention BlockMask — left unchanged, i.e. full context on S layers
 
         attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
             self.config._attn_implementation, eager_attention_forward
@@ -484,15 +487,32 @@ class EZModel(EZPreTrainedModel):
         # ------------------------------------------------------------------
         # Smear: mix previous token embedding into current position
         # ------------------------------------------------------------------
+        # Applied at every position — prefill, cached decode and chunked prefill alike:
+        # the predecessor of local position 0 comes from the cache when there is one.
         T = hidden_states.shape[1]
-        if past_seen_tokens == 0 and T > 1:
-            gate = self.smear_lambda.to(hidden_states.dtype) * torch.sigmoid(
-                self.smear_gate(hidden_states[:, 1:, : self.config.smear_gate_in_features])
-            )
-            hidden_states = torch.cat(
-                [hidden_states[:, :1], hidden_states[:, 1:] + gate * hidden_states[:, :-1]],
-                dim=1,
-            )
+        prev = getattr(past_key_values, "ez_prev_embed", None) if past_key_values is not None else None
+        if past_key_values is not None:
+            # stash the PRE-smear normalised embedding of the last token, as training does
+            past_key_values.ez_prev_embed = hidden_states[:, -1:].clone()
+        if prev is None:
+            prev = torch.zeros_like(hidden_states[:, :1])  # position 0 has no predecessor
+        prev_all = torch.cat([prev.to(hidden_states.dtype), hidden_states[:, :-1]], dim=1)
+        if (
+            attention_mask is not None
+            and isinstance(attention_mask, torch.Tensor)
+            and attention_mask.ndim == 2
+            and attention_mask.shape[1] >= T
+        ):
+            # left padding: never smear a pad token's embedding into the first real token
+            mask_2d = attention_mask.to(hidden_states.dtype)
+            start = mask_2d.shape[1] - T  # global index of local position 0
+            idx = torch.arange(start - 1, start + T - 1, device=mask_2d.device)
+            valid = (idx >= 0).to(mask_2d.dtype)
+            prev_all = prev_all * (mask_2d[:, idx.clamp(min=0)] * valid)[:, :, None]
+        gate = self.smear_lambda.to(hidden_states.dtype) * torch.sigmoid(
+            self.smear_gate(hidden_states[:, :, : self.config.smear_gate_in_features])
+        )
+        hidden_states = hidden_states + gate * prev_all
 
         # ------------------------------------------------------------------
         # Transformer trunk with per-layer resid/x0 scalars, window, backout
@@ -603,7 +623,6 @@ class EZForCausalLM(EZPreTrainedModel, GenerationMixin):
         >>> generated_tokens = outputs[0, inputs["input_ids"].shape[1]:]
         >>> output = tokenizer.decode(generated_tokens, skip_special_tokens=True)
         ```"""
-        # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
         outputs: BaseModelOutputWithPast = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -615,9 +634,10 @@ class EZForCausalLM(EZPreTrainedModel, GenerationMixin):
         )
 
         hidden_states = outputs.last_hidden_state
-        # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-        logits = self.lm_head(hidden_states[:, slice_indices, :])
+        # Upcast before the softcap, as training does: in bf16 the spacing at |x| ~ 15 is 0.0625,
+        # which is the range softcapped logits live in.
+        logits = self.lm_head(hidden_states[:, slice_indices, :]).float()
         if self.config.final_logit_softcapping is not None:
             logits = logits / self.config.final_logit_softcapping
             logits = torch.tanh(logits)
